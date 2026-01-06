@@ -3,9 +3,11 @@ import pandas as pd
 import tempfile
 import os
 import json
+import mysql.connector
+import urllib.parse
 from dotenv import load_dotenv
 
-# --- UPDATED IMPORTS ---
+# --- IMPORTS FOR AI ---
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_community.document_loaders import PyPDFLoader
@@ -13,66 +15,163 @@ from langchain_community.document_loaders import PyPDFLoader
 # 1. Load Environment Variables
 load_dotenv()
 
-# 2. Initialize the Brain (LLM)
+# 2. Check OpenAI Key
 if not os.getenv("OPENAI_API_KEY"):
-    st.error("Missing OpenAI API Key. Please ensure OPENAI_API_KEY is set in your .env file.")
+    st.error("Missing OpenAI API Key. Please add it to your .env file.")
     st.stop()
 
+# 3. Initialize AI
 llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
-# --- HELPER FUNCTIONS ---
+# --- DATABASE FUNCTIONS ---
+
+def get_db_connection():
+    """Connect to MySQL using .env credentials including PORT"""
+    try:
+        return mysql.connector.connect(
+            host=os.getenv("DB_HOST"),
+            user=os.getenv("DB_USER"),
+            password=os.getenv("DB_PASSWORD"),
+            database=os.getenv("DB_NAME"),
+            port=int(os.getenv("DB_PORT", 3306))
+        )
+    except mysql.connector.Error as err:
+        st.error(f" Database Connection Failed: {err}")
+        return None
+
+def save_rfp_to_db(criteria):
+    """Saves the Benchmark Rules to MySQL"""
+    conn = get_db_connection()
+    if not conn: return None
+    
+    cursor = conn.cursor()
+    must_haves_str = ", ".join(criteria.get('must_haves', []))
+    
+    query = """
+        INSERT INTO rfp_benchmarks (project_name, budget_cap, timeline, must_haves)
+        VALUES (%s, %s, %s, %s)
+    """
+    values = ("New RFP Project", criteria.get('budget_cap'), criteria.get('timeline'), must_haves_str)
+    
+    try:
+        cursor.execute(query, values)
+        conn.commit()
+        rfp_id = cursor.lastrowid
+        return rfp_id
+    except mysql.connector.Error as err:
+        st.error(f"Error saving RFP: {err}")
+        return None
+    finally:
+        cursor.close()
+        conn.close()
+
+def save_vendor_result_to_db(rfp_id, data):
+    """Saves the Vendor Score to MySQL"""
+    conn = get_db_connection()
+    if not conn: return
+    
+    cursor = conn.cursor()
+    flags_str = ", ".join(data.get('flags', []))
+    
+    query = """
+        INSERT INTO vendor_results 
+        (rfp_id, vendor_name, overall_score, cost_score, technical_score, flags, recommendation)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """
+    values = (
+        rfp_id,
+        data.get('vendor_name', 'Unknown'),
+        data.get('overall_score', 0),
+        data.get('cost_score', 0),
+        data.get('technical_score', 0),
+        flags_str,
+        data.get('recommendation', 'Review')
+    )
+    
+    try:
+        cursor.execute(query, values)
+        conn.commit()
+    except mysql.connector.Error as err:
+        st.error(f"Error saving Vendor: {err}")
+    finally:
+        cursor.close()
+        conn.close()
+
+def fetch_history():
+    """Reads past data from MySQL"""
+    conn = get_db_connection()
+    if not conn: return pd.DataFrame()
+    
+    query = """
+        SELECT v.vendor_name, v.overall_score, v.recommendation, r.budget_cap, v.created_at 
+        FROM vendor_results v
+        JOIN rfp_benchmarks r ON v.rfp_id = r.id
+        ORDER BY v.created_at DESC
+    """
+    try:
+        df = pd.read_sql(query, conn)
+        return df
+    except Exception as e:
+        st.error(f"Error fetching history: {e}")
+        return pd.DataFrame()
+    finally:
+        conn.close()
+
+# --- AI HELPER FUNCTIONS ---
+
+def clean_and_parse_json(ai_response_text):
+    """Helper to clean JSON output from AI"""
+    text = ai_response_text.replace('```json', '').replace('```', '')
+    start_idx = text.find('{')
+    end_idx = text.rfind('}') + 1
+    
+    if start_idx != -1 and end_idx != -1:
+        text = text[start_idx:end_idx]
+    try:
+        return json.loads(text)
+    except:
+        return {}
 
 def extract_text_from_pdf(uploaded_file):
-    """Save uploaded file temporarily and extract text."""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
         temp_file.write(uploaded_file.read())
         temp_path = temp_file.name
-    
     loader = PyPDFLoader(temp_path)
     pages = loader.load_and_split()
-    os.remove(temp_path) # Clean up
+    os.remove(temp_path)
     return " ".join([p.page_content for p in pages])
 
 def extract_benchmark_criteria(text):
-    """Extracts parameters from the Manager's RFP document."""
     prompt = ChatPromptTemplate.from_template("""
-        You are a Procurement Expert. Analyze this RFP document text and extract the key evaluation criteria.
-        Return the output ONLY as a JSON object with this structure:
+        Extract key RFP criteria as JSON:
         {{
-            "budget_cap": "The maximum budget allowed",
-            "timeline": "The required delivery timeline",
-            "must_haves": ["List of mandatory technical requirements"],
-            "nice_to_haves": ["List of optional requirements"],
-            "payment_terms": "Preferred payment terms"
+            "budget_cap": "Max budget",
+            "timeline": "Delivery time",
+            "must_haves": ["List of requirements"]
         }}
-        
-        RFP Text: {text}
+        Text: {text}
     """)
     chain = prompt | llm
     response = chain.invoke({"text": text})
-    clean_json = response.content.replace('```json', '').replace('```', '')
-    return json.loads(clean_json)
+    return clean_and_parse_json(response.content)
 
 def analyze_vendor_proposal(criteria, vendor_text, vendor_name):
-    """Compares a vendor proposal against the extracted criteria."""
+    # UPDATED: Now asks for 'contact_email'
     prompt = ChatPromptTemplate.from_template("""
-        You are a Scoring Engine. Compare the Vendor Proposal against the Benchmark Criteria.
+        Compare Vendor Proposal vs Benchmark: {criteria}
+        Vendor Text: {vendor_text}
         
-        Benchmark Criteria: {criteria}
-        Vendor Proposal: {vendor_text}
-        
-        Analyze strictly. Return output ONLY as a JSON object:
+        Output JSON:
         {{
             "vendor_name": "{vendor_name}",
-            "cost_score": 0,
-            "technical_score": 0,
-            "delivery_score": 0,
-            "overall_score": 0,
-            "flags": ["List specific issues like 'Over budget by $5k' or 'Missing ISO cert'"],
-            "recommendation": "Approve, Reject, or Negotiate"
+            "contact_email": "Extract email address from text (if none found, return '')",
+            "cost_score": 0-100,
+            "technical_score": 0-100,
+            "delivery_score": 0-100,
+            "overall_score": 0-100,
+            "flags": ["List issues"],
+            "recommendation": "Approve/Reject"
         }}
-        
-        Note: Scores must be integers (0-100).
     """)
     chain = prompt | llm
     response = chain.invoke({
@@ -80,27 +179,20 @@ def analyze_vendor_proposal(criteria, vendor_text, vendor_name):
         "vendor_text": vendor_text,
         "vendor_name": vendor_name
     })
-    clean_json = response.content.replace('```json', '').replace('```', '')
-    return json.loads(clean_json)
+    return clean_and_parse_json(response.content)
 
 def generate_negotiation_email(vendor_name, flags, recommendation, criteria):
-    """Generates a specific email based on the analysis."""
     prompt = ChatPromptTemplate.from_template("""
-        You are a Senior Procurement Manager. Write a professional email to the vendor "{vendor_name}".
+        Write a professional procurement email to "{vendor_name}".
+        Recommendation: {recommendation}.
+        Issues: {flags}.
+        Requirements: {criteria}
         
-        Context:
-        - We analyzed their proposal.
-        - The internal recommendation is: {recommendation}.
-        - The identified issues/flags are: {flags}.
-        - Our Benchmark Requirements: {criteria}
+        If Reject: Polite rejection citing issues.
+        If Negotiate: Ask to fix issues.
+        If Approve: Next steps.
         
-        Instructions:
-        1. If Recommendation is "Reject": Write a polite but firm rejection email citing the flags.
-        2. If Recommendation is "Negotiate": Ask them to revise their quote to address the flags (e.g., lower price, faster delivery).
-        3. If Recommendation is "Approve": Write a next-steps email to finalize the contract.
-        
-        Tone: Professional, Direct, and Courteous.
-        Output: ONLY the email subject and body.
+        Output ONLY the email body text.
     """)
     chain = prompt | llm
     response = chain.invoke({
@@ -113,150 +205,146 @@ def generate_negotiation_email(vendor_name, flags, recommendation, criteria):
 
 # --- THE UI (Streamlit) ---
 
-st.set_page_config(page_title="AI Procurement Copilot", layout="wide")
+st.set_page_config(page_title="AI Procurement System", layout="wide")
+st.title("🤖 RFP Automation (Ultimate Edition)")
 
-st.title("🤖 RFP & RFQ Automation System")
-st.markdown("---")
-
-# Session State Initialization
+# Initialize Session State
 if 'criteria' not in st.session_state:
     st.session_state['criteria'] = None
+if 'rfp_db_id' not in st.session_state:
+    st.session_state['rfp_db_id'] = None
 if 'vendor_results' not in st.session_state:
     st.session_state['vendor_results'] = []
 
-# --- STEP 1: UPLOAD RFP ---
-st.header("Step 1: Benchmark Definition")
-rfp_file = st.file_uploader("Upload RFP/RFQ Document (PDF)", type="pdf", key="rfp")
+# Tabs
+tab1, tab2 = st.tabs([" New Analysis", " Database History"])
 
-if rfp_file and st.button("Analyze RFP Requirements"):
-    with st.spinner("Extracting parameters..."):
-        try:
+with tab1:
+    # --- STEP 1: UPLOAD RFP ---
+    st.subheader("Step 1: Define Benchmarks")
+    rfp_file = st.file_uploader("Upload RFP Document", type="pdf", key="rfp")
+
+    if rfp_file and st.button("Analyze & Save RFP"):
+        with st.spinner("Extracting & Saving to Database..."):
             text = extract_text_from_pdf(rfp_file)
             st.session_state['criteria'] = extract_benchmark_criteria(text)
+            
             st.success("Parameters Extracted!")
-        except Exception as e:
-            st.error(f"Error reading PDF: {e}")
+            
+            # Save to DB
+            rfp_id = save_rfp_to_db(st.session_state['criteria'])
+            if rfp_id:
+                st.session_state['rfp_db_id'] = rfp_id
+                st.toast(f"Saved to DB ID: {rfp_id}")
 
-# --- STEP 2: HUMAN VALIDATION ---
-if st.session_state['criteria']:
-    st.subheader("✅ Validate Evaluation Parameters")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        new_budget = st.text_input("Budget Cap", st.session_state['criteria'].get('budget_cap', 'N/A'))
-        st.session_state['criteria']['budget_cap'] = new_budget
-    with col2:
-        new_time = st.text_input("Timeline", st.session_state['criteria'].get('timeline', 'N/A'))
-        st.session_state['criteria']['timeline'] = new_time
+    # Human Validation Section
+    if st.session_state['criteria']:
+        st.markdown("###  Extracted Requirements")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.info(f" **Budget Cap:** {st.session_state['criteria'].get('budget_cap')}")
+        with c2:
+            st.info(f" **Timeline:** {st.session_state['criteria'].get('timeline')}")
         
-    with st.expander("View Technical Requirements"):
-        st.write(st.session_state['criteria'].get('must_haves', []))
-    
+        with st.expander("See Technical Must-Haves"):
+            st.write(st.session_state['criteria'].get('must_haves'))
+
+    # --- STEP 2: VENDOR SCORING ---
     st.markdown("---")
+    st.subheader("Step 2: Score Vendors")
+    vendor_files = st.file_uploader("Upload Vendor PDFs", type="pdf", accept_multiple_files=True, key="vendors")
 
-    # --- STEP 3: VENDOR SCORING ---
-    st.header("Step 2: Vendor Proposal Analysis")
-    
-    vendor_files = st.file_uploader("Upload Vendor Proposals (PDFs)", type="pdf", accept_multiple_files=True, key="vendors")
-    
-    if vendor_files and st.button("Run Scoring Engine"):
-        st.session_state['vendor_results'] = []
-        progress_bar = st.progress(0)
-        
-        for idx, v_file in enumerate(vendor_files):
-            with st.spinner(f"Analyzing {v_file.name}..."):
-                try:
+    if vendor_files and st.button("Score & Save Results"):
+        if not st.session_state['rfp_db_id']:
+            st.error("Please analyze an RFP first!")
+        else:
+            st.session_state['vendor_results'] = []
+            progress_bar = st.progress(0)
+            
+            for idx, v_file in enumerate(vendor_files):
+                with st.spinner(f"Processing {v_file.name}..."):
                     v_text = extract_text_from_pdf(v_file)
                     score_data = analyze_vendor_proposal(st.session_state['criteria'], v_text, v_file.name)
-                    st.session_state['vendor_results'].append(score_data)
-                except Exception as e:
-                    st.error(f"Error analyzing {v_file.name}: {e}")
-                
-                progress_bar.progress((idx + 1) / len(vendor_files))
-                
-        st.success("Scoring Complete!")
-
-# --- STEP 4: GOVERNANCE & RESULTS ---
-if st.session_state['vendor_results']:
-    st.header("Step 3: Governance & Comparison")
-    
-    df = pd.DataFrame(st.session_state['vendor_results'])
-    
-    # 4.1 Comparison Matrix (Side-by-Side View)
-    st.subheader("📊 Detailed Side-by-Side Comparison")
-    
-    comparison_data = {}
-    
-    # Add Benchmark Column
-    comparison_data['Benchmark'] = {
-        "Overall Score": "100",
-        "Cost": st.session_state['criteria'].get('budget_cap'),
-        "Timeline": st.session_state['criteria'].get('timeline'),
-        "Status": "Target"
-    }
-    
-    # Add Vendor Columns
-    for res in st.session_state['vendor_results']:
-        comparison_data[res['vendor_name']] = {
-            "Overall Score": res['overall_score'],
-            "Cost": f"Score: {res['cost_score']}",
-            "Timeline": f"Score: {res['delivery_score']}",
-            "Status": res['recommendation']
-        }
-    
-    # Display Matrix
-    compare_df = pd.DataFrame(comparison_data)
-    st.table(compare_df)
-    
-    # 4.2 Main Scoring Table
-    st.subheader("🏆 Scoring Table")
-    st.dataframe(
-        df[['vendor_name', 'overall_score', 'cost_score', 'technical_score', 'recommendation', 'flags']],
-        use_container_width=True
-    )
-    
-    # 4.3 Supervisor Bot
-    st.subheader("🤖 Supervisor Bot Insights")
-    for res in st.session_state['vendor_results']:
-        score = int(res.get('overall_score', 0))
-        if score < 60:
-            st.warning(f"⚠️ **{res['vendor_name']}**: Low score detected ({score}). Recommendation: {res['recommendation']}")
-        if res.get('flags'):
-            st.error(f"🚩 **{res['vendor_name']} Risk Flags**: {res['flags']}")
-
-    # --- STEP 5: NEGOTIATOR & EXPORT ---
-    st.markdown("---")
-    st.header("Step 4: Actions")
-    
-    col_a, col_b = st.columns(2)
-    
-    # Export Report
-    with col_a:
-        st.subheader("📥 Download Report")
-        csv = df.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="Download Analysis (CSV)",
-            data=csv,
-            file_name="procurement_analysis.csv",
-            mime="text/csv",
-        )
-
-    # Email Negotiator
-    with col_b:
-        st.subheader("📧 Negotiation Assistant")
-        selected_vendor = st.selectbox("Select Vendor to Email:", [v['vendor_name'] for v in st.session_state['vendor_results']])
-        
-        if st.button("Draft Email"):
-            # Find the data for the selected vendor
-            vendor_data = next(item for item in st.session_state['vendor_results'] if item["vendor_name"] == selected_vendor)
+                    if score_data:
+                        st.session_state['vendor_results'].append(score_data)
+                        save_vendor_result_to_db(st.session_state['rfp_db_id'], score_data)
+                    progress_bar.progress((idx + 1) / len(vendor_files))
             
-            with st.spinner("Drafting email..."):
-                email_draft = generate_negotiation_email(
-                    vendor_name=vendor_data['vendor_name'],
-                    flags=vendor_data['flags'],
-                    recommendation=vendor_data['recommendation'],
-                    criteria=st.session_state['criteria']
-                )
+            st.success("Analysis Complete & Saved!")
+
+    # --- STEP 3: COMPARISON MATRIX ---
+    if st.session_state['vendor_results']:
+        st.markdown("---")
+        st.subheader(" Side-by-Side Comparison")
+        
+        # Build the Matrix
+        comparison_data = {}
+        comparison_data['Benchmark'] = {
+            "Budget": st.session_state['criteria'].get('budget_cap'),
+            "Timeline": st.session_state['criteria'].get('timeline'),
+            "Overall Score": "TARGET",
+            "Recommendation": "-"
+        }
+        
+        for res in st.session_state['vendor_results']:
+            comparison_data[res['vendor_name']] = {
+                "Budget": f"Score: {res.get('cost_score', 0)}",
+                "Timeline": f"Score: {res.get('delivery_score', 0)}",
+                "Overall Score": res.get('overall_score', 0),
+                "Recommendation": res.get('recommendation', 'N/A')
+            }
+        
+        st.table(pd.DataFrame(comparison_data))
+
+        # --- STEP 4: ACTIONS ---
+        st.markdown("---")
+        st.header("Step 4: Actions")
+        
+        col_a, col_b = st.columns(2)
+        
+        with col_a:
+            st.subheader(" Export Report")
+            df = pd.DataFrame(st.session_state['vendor_results'])
+            csv = df.to_csv(index=False).encode('utf-8')
+            st.download_button("Download CSV", csv, "rfp_report.csv", "text/csv")
+            
+        with col_b:
+            st.subheader(" Negotiation Assistant")
+            
+            vendor_names = [v['vendor_name'] for v in st.session_state['vendor_results']]
+            selected_vendor = st.selectbox("Select Vendor to Email:", vendor_names)
+            
+            if st.button("Draft Negotiation Email"):
+                v_data = next(v for v in st.session_state['vendor_results'] if v['vendor_name'] == selected_vendor)
                 
-            st.text_area("Draft Email", value=email_draft, height=300)
-            st.info("You can copy this text into Outlook/Gmail.")
+                with st.spinner("Drafting email..."):
+                    email_content = generate_negotiation_email(
+                        v_data['vendor_name'], 
+                        v_data.get('flags', []), 
+                        v_data.get('recommendation', 'N/A'), 
+                        st.session_state['criteria']
+                    )
+                
+                st.text_area("AI Draft", value=email_content, height=250)
+                
+                # --- AUTO FILL EMAIL BUTTON ---
+                recipient = v_data.get('contact_email', '') # Get extracted email
+                subject = f"Regarding Proposal: {selected_vendor}"
+                body_encoded = urllib.parse.quote(email_content)
+                mailto_link = f"mailto:{recipient}?subject={subject}&body={body_encoded}"
+                
+                st.markdown(f'''
+                    <a href="{mailto_link}" target="_blank" style="
+                        background-color: #0078D4; color: white; padding: 10px 20px; 
+                        text-decoration: none; border-radius: 5px; font-weight: bold;
+                        display: inline-block; margin-top: 10px;
+                    ">
+                     Open in Outlook (Send to: {recipient if recipient else 'Unknown'})
+                    </a>
+                ''', unsafe_allow_html=True)
+
+with tab2:
+    st.header(" Database History")
+    if st.button("Refresh History"):
+        df_hist = fetch_history()
+        st.dataframe(df_hist, use_container_width=True)
