@@ -7,7 +7,10 @@ import mysql.connector
 import urllib.parse
 from dotenv import load_dotenv
 
-# --- IMPORTS FOR AI ---
+#  NEW IMPORTS FOR NETWORK FIX 
+import httpx
+
+#  IMPORTS FOR AI 
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_community.document_loaders import PyPDFLoader
@@ -15,15 +18,28 @@ from langchain_community.document_loaders import PyPDFLoader
 # 1. Load Environment Variables
 load_dotenv()
 
+#  NETWORK FIX: UNSET PROXIES & BYPASS SSL 
+# This forces the script to use your Hotspot directly, ignoring corporate proxy settings
+for env_var in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']:
+    if env_var in os.environ:
+        del os.environ[env_var]
+
 # 2. Check OpenAI Key
 if not os.getenv("OPENAI_API_KEY"):
     st.error("Missing OpenAI API Key. Please add it to your .env file.")
     st.stop()
 
-# 3. Initialize AI (Using GPT-4o for maximum context)
-llm = ChatOpenAI(model="gpt-4o", temperature=0)
+# 3. Initialize AI (With SSL Verification Disabled & Increased Timeout)
+# This fixes the "Connection Error" on corporate laptops
+custom_http_client = httpx.Client(verify=False, timeout=60.0)
 
-# --- DATABASE FUNCTIONS ---
+llm = ChatOpenAI(
+    model="gpt-4o", 
+    temperature=0,
+    http_client=custom_http_client  # <--- This is the critical fix
+)
+
+#  DATABASE FUNCTIONS 
 
 def get_db_connection():
     """Connect to MySQL using .env credentials"""
@@ -128,7 +144,7 @@ def fetch_history():
     finally:
         conn.close()
 
-# --- AI HELPER FUNCTIONS ---
+#  AI HELPER FUNCTIONS 
 
 def clean_and_parse_json(ai_response_text):
     text = ai_response_text.replace('```json', '').replace('```', '')
@@ -189,9 +205,6 @@ def extract_benchmark_criteria(text):
     return clean_and_parse_json(response.content)
 
 def analyze_vendor_proposal(criteria, vendor_text, vendor_name):
-    """
-    UPDATED: Now asks for 'scoring_reasoning' to explain why a score (e.g. 25) was given.
-    """
     prompt = ChatPromptTemplate.from_template("""
         You are a Proposal Evaluator. Compare this Vendor Proposal against the RFP Requirements.
         
@@ -251,8 +264,7 @@ def generate_negotiation_email(vendor_name, flags, recommendation, criteria):
 
 st.set_page_config(page_title="AI Procurement System", layout="wide")
 
-# 1. CHANGED: Removed "Deep Dive Edition" text
-st.title("🤖 RFP Analyzer 3.0")
+st.title(" BOT Analyzer")
 
 # Initialize Session State
 if 'criteria' not in st.session_state:
@@ -263,10 +275,10 @@ if 'vendor_results' not in st.session_state:
     st.session_state['vendor_results'] = []
 
 # Tabs
-tab1, tab2 = st.tabs(["📂 Analysis", "🗄️ Database History"])
+tab1, tab2 = st.tabs([" Analysis", " Database History"])
 
 with tab1:
-    # --- STEP 1: UPLOAD RFP ---
+    #  STEP 1: UPLOAD RFP 
     st.subheader("Step 1: Analyze RFP Document")
     rfp_file = st.file_uploader("Upload RFP Document", type="pdf", key="rfp")
 
@@ -279,23 +291,23 @@ with tab1:
             rfp_id = save_rfp_to_db(st.session_state['criteria'])
             if rfp_id:
                 st.session_state['rfp_db_id'] = rfp_id
-                st.success("✅ RFP Analyzed & Saved!")
+                st.success(" RFP Analyzed & Saved!")
 
     # Display Data
     if st.session_state['criteria']:
         data = st.session_state['criteria']
-        st.markdown(f"### 📋 Project: {data.get('project_name', 'Unknown')}")
+        st.markdown(f"###  Project: {data.get('project_name', 'Unknown')}")
         
         k1, k2, k3, k4 = st.columns(4)
-        with k1: st.info(f"💰 **Budget:**\n{data.get('budget_cap')}")
-        with k2: st.info(f"⏳ **Timeline:**\n{data.get('timeline')}")
-        with k3: st.warning(f"⚠️ **Penalties:**\n{data.get('penalty_clauses')}")
-        with k4: st.success(f"💳 **Payment:**\n{data.get('payment_terms')}")
+        with k1: st.info(f" **Budget:**\n{data.get('budget_cap')}")
+        with k2: st.info(f" **Timeline:**\n{data.get('timeline')}")
+        with k3: st.warning(f" **Penalties:**\n{data.get('penalty_clauses')}")
+        with k4: st.success(f" **Payment:**\n{data.get('payment_terms')}")
 
-        with st.expander("🔍 Technical Requirements", expanded=False):
+        with st.expander(" Technical Requirements", expanded=False):
             st.write(data.get('technical_must_haves', []))
 
-    # --- STEP 2: VENDOR SCORING ---
+    #  STEP 2: VENDOR SCORING 
     st.markdown("---")
     st.subheader("Step 2: Score Vendors")
     vendor_files = st.file_uploader("Upload Vendor Proposals", type="pdf", accept_multiple_files=True, key="vendors")
@@ -318,39 +330,38 @@ with tab1:
             
             st.success("Analysis Complete!")
 
-    # --- STEP 3: RESULTS TABLE (UPDATED) ---
+    #  STEP 3: RESULTS TABLE 
     if st.session_state['vendor_results']:
         st.markdown("---")
-        st.subheader("🏆 Vendor Comparison Matrix")
+        st.subheader(" Vendor Comparison Matrix")
         
         comparison_data = []
         for res in st.session_state['vendor_results']:
-            # 2. ADDED: Logic to show RFP Name and Score Reasoning
             comparison_data.append({
-                "RFP Project": st.session_state['criteria'].get('project_name'), # Added RFP Name
+                "RFP Project": st.session_state['criteria'].get('project_name'),
                 "Vendor": res['vendor_name'],
                 "Overall Score": res.get('overall_score', 0),
-                "Score Reasoning": res.get('scoring_reasoning', 'N/A'), # Added Score Reasoning
+                "Score Reasoning": res.get('scoring_reasoning', 'N/A'),
                 "Tech Score": res.get('technical_score', 0),
                 "Compliance Score": res.get('compliance_score', 0),
                 "Recommendation": res.get('recommendation', 'N/A'),
-                "Red Flags": str(res.get('flags', [])[:3]) # Limit flags length
+                "Red Flags": str(res.get('flags', [])[:3])
             })
         
         st.dataframe(pd.DataFrame(comparison_data), use_container_width=True)
 
-        # --- STEP 4: ACTIONS ---
+        #  STEP 4: ACTIONS 
         st.markdown("---")
         col_a, col_b = st.columns(2)
         
         with col_a:
-            st.subheader("📥 Export Report")
+            st.subheader(" Export Report")
             df = pd.DataFrame(st.session_state['vendor_results'])
             csv = df.to_csv(index=False).encode('utf-8')
             st.download_button("Download CSV", csv, "final_report.csv", "text/csv")
             
         with col_b:
-            st.subheader("📧 Smart Negotiation")
+            st.subheader(" Smart Negotiation")
             vendor_names = [v['vendor_name'] for v in st.session_state['vendor_results']]
             selected_vendor = st.selectbox("Select Vendor:", vendor_names)
             
@@ -366,7 +377,7 @@ with tab1:
                 st.text_area("AI Draft", value=email_content, height=200)
 
 with tab2:
-    st.header("🗄️ Database History")
+    st.header(" Database History")
     if st.button("Refresh"):
         df_hist = fetch_history()
         st.dataframe(df_hist, use_container_width=True)
