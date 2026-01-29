@@ -7,10 +7,10 @@ import mysql.connector
 import urllib.parse
 from dotenv import load_dotenv
 
-#  NEW IMPORTS FOR NETWORK FIX 
+# IMPORTS FOR NETWORK FIX
 import httpx
 
-#  IMPORTS FOR AI 
+# IMPORTS FOR AI
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_community.document_loaders import PyPDFLoader
@@ -18,8 +18,7 @@ from langchain_community.document_loaders import PyPDFLoader
 # 1. Load Environment Variables
 load_dotenv()
 
-#  NETWORK FIX: UNSET PROXIES & BYPASS SSL 
-# This forces the script to use your Hotspot directly, ignoring corporate proxy settings
+# NETWORK FIX: UNSET PROXIES & BYPASS SSL
 for env_var in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']:
     if env_var in os.environ:
         del os.environ[env_var]
@@ -30,16 +29,15 @@ if not os.getenv("OPENAI_API_KEY"):
     st.stop()
 
 # 3. Initialize AI (With SSL Verification Disabled & Increased Timeout)
-# This fixes the "Connection Error" on corporate laptops
 custom_http_client = httpx.Client(verify=False, timeout=60.0)
 
 llm = ChatOpenAI(
     model="gpt-4o", 
     temperature=0,
-    http_client=custom_http_client  # <--- This is the critical fix
+    http_client=custom_http_client
 )
 
-#  DATABASE FUNCTIONS 
+# --- DATABASE FUNCTIONS (NO SCHEMA CHANGES) ---
 
 def get_db_connection():
     """Connect to MySQL using .env credentials"""
@@ -62,7 +60,6 @@ def save_rfp_to_db(criteria):
     
     cursor = conn.cursor()
     
-    # Pack complex fields
     tech_str = " | ".join(criteria.get('technical_must_haves', []))
     payment_str = str(criteria.get('payment_terms', 'N/A'))
     penalty_str = str(criteria.get('penalty_clauses', 'N/A'))
@@ -93,7 +90,8 @@ def save_rfp_to_db(criteria):
         conn.close()
 
 def save_vendor_result_to_db(rfp_id, data):
-    """Saves the Vendor Score to MySQL"""
+    """Saves the Vendor Score to MySQL. 
+       NOTE: This ignores the 'compliance_breakdown' list, so no DB changes are needed."""
     conn = get_db_connection()
     if not conn: return
     
@@ -144,7 +142,7 @@ def fetch_history():
     finally:
         conn.close()
 
-#  AI HELPER FUNCTIONS 
+# --- AI HELPER FUNCTIONS ---
 
 def clean_and_parse_json(ai_response_text):
     text = ai_response_text.replace('```json', '').replace('```', '')
@@ -172,20 +170,7 @@ def extract_text_from_pdf(uploaded_file):
 def extract_benchmark_criteria(text):
     prompt = ChatPromptTemplate.from_template("""
         You are a Senior Technical Procurement Officer. 
-        Analyze this RFP document deeply (Text length: {length}).
-        
-        Do NOT summarize. Be EXHAUSTIVE. Extract specific details.
-        
-        1. **Project Name**: Title of the RFP.
-        2. **Budget**: 
-           - Look for "Estimated Cost" or "Tender Value".
-           - IF NOT FOUND: Look for "EMD" (Earnest Money Deposit).
-           - CALCULATE: Estimated Budget = EMD Amount * 100.
-           - Return the calculated amount labeled as "Estimated based on EMD".
-        3. **Timeline**: Extract specific duration (e.g., "1 year implementation + 3 years ATS").
-        4. **Payment Terms**: Extract the exact milestones.
-        5. **Penalty Clauses**: Extract Liquidated Damages (LD) percentages.
-        6. **Technical Must-Haves**: Extract at least 20 distinct technical requirements.
+        Analyze this RFP document.
         
         Output valid JSON:
         {{
@@ -201,40 +186,51 @@ def extract_benchmark_criteria(text):
         {text}
     """)
     chain = prompt | llm
-    response = chain.invoke({"text": text[:200000], "length": len(text)})
+    response = chain.invoke({"text": text[:200000]})
     return clean_and_parse_json(response.content)
 
 def analyze_vendor_proposal(criteria, vendor_text, vendor_name):
+    # Convert list of technical requirements to a string for the prompt
+    tech_reqs_str = "\n".join(criteria.get('technical_must_haves', []))
+
     prompt = ChatPromptTemplate.from_template("""
         You are a Proposal Evaluator. Compare this Vendor Proposal against the RFP Requirements.
         
-        RFP Requirements: {criteria}
+        RFP Technical Requirements: 
+        {tech_reqs}
         
-        Vendor Text (Truncated): {vendor_text}
+        Vendor Text (Truncated): 
+        {vendor_text}
         
         Task:
-        1. Search for the vendor's email.
-        2. Score them based on the RFP criteria.
-        3. **CRITICAL:** Provide a short "scoring_reasoning" explaining exactly why you gave the Overall Score.
-           (e.g., "Score is 25 because vendor missed all technical requirements but accepted payment terms.")
+        1. Score the vendor (0-100) on Cost, Technical, and Compliance.
+        2. **CRITICAL:** Create a "compliance_breakdown" list. 
+           - Go through every single item in the "RFP Technical Requirements" list.
+           - Check if the vendor mentions it.
+           - Output fields: "RFP_Parameter", "Vendor_Status" (Match/Partial/Mismatch), and "Vendor_Evidence" (Short quote).
         
         Output JSON:
         {{
             "vendor_name": "{vendor_name}",
-            "contact_email": "Email address found",
             "cost_score": 0-100,
             "technical_score": 0-100,
-            "compliance_score": 0-100,
             "overall_score": 0-100,
-            "scoring_reasoning": "EXPLAIN WHY THE SCORE IS LOW OR HIGH HERE",
-            "flags": ["List specific missing requirements", "Deviations"],
-            "recommendation": "Strongly Approve / Negotiate / Reject"
+            "scoring_reasoning": "Explain score...",
+            "flags": ["List red flags"],
+            "recommendation": "Approve/Reject",
+            "compliance_breakdown": [
+                {{
+                    "RFP_Parameter": "Requirement text...",
+                    "Vendor_Status": "Match",
+                    "Vendor_Evidence": "Vendor quote..."
+                }}
+            ]
         }}
     """)
     
     chain = prompt | llm
     response = chain.invoke({
-        "criteria": json.dumps(criteria),
+        "tech_reqs": tech_reqs_str,
         "vendor_text": vendor_text[:100000], 
         "vendor_name": vendor_name
     })
@@ -242,14 +238,11 @@ def analyze_vendor_proposal(criteria, vendor_text, vendor_name):
 
 def generate_negotiation_email(vendor_name, flags, recommendation, criteria):
     prompt = ChatPromptTemplate.from_template("""
-        Write a professional procurement email to "{vendor_name}".
+        Write a procurement email to "{vendor_name}".
         Recommendation: {recommendation}.
-        Issues identified: {flags}.
-        
-        Context:
+        Issues: {flags}.
         Project: "{project}".
-        
-        Output ONLY the email body text.
+        Output ONLY the email body.
     """)
     chain = prompt | llm
     response = chain.invoke({
@@ -278,7 +271,7 @@ if 'vendor_results' not in st.session_state:
 tab1, tab2 = st.tabs([" Analysis", " Database History"])
 
 with tab1:
-    #  STEP 1: UPLOAD RFP 
+    # STEP 1: UPLOAD RFP
     st.subheader("Step 1: Analyze RFP Document")
     rfp_file = st.file_uploader("Upload RFP Document", type="pdf", key="rfp")
 
@@ -307,7 +300,7 @@ with tab1:
         with st.expander(" Technical Requirements", expanded=False):
             st.write(data.get('technical_must_haves', []))
 
-    #  STEP 2: VENDOR SCORING 
+    # STEP 2: VENDOR SCORING
     st.markdown("---")
     st.subheader("Step 2: Score Vendors")
     vendor_files = st.file_uploader("Upload Vendor Proposals", type="pdf", accept_multiple_files=True, key="vendors")
@@ -325,48 +318,95 @@ with tab1:
                     score_data = analyze_vendor_proposal(st.session_state['criteria'], v_text, v_file.name)
                     if score_data:
                         st.session_state['vendor_results'].append(score_data)
+                        # Save summary to DB (ignores the detailed list automatically)
                         save_vendor_result_to_db(st.session_state['rfp_db_id'], score_data)
                     progress_bar.progress((idx + 1) / len(vendor_files))
             
             st.success("Analysis Complete!")
 
-    #  STEP 3: RESULTS TABLE 
+    # STEP 3: RESULTS & DETAILED TABLES
     if st.session_state['vendor_results']:
         st.markdown("---")
-        st.subheader(" Vendor Comparison Matrix")
+        st.subheader(" High-Level Comparison Matrix")
         
+        # Summary Table
         comparison_data = []
         for res in st.session_state['vendor_results']:
             comparison_data.append({
-                "RFP Project": st.session_state['criteria'].get('project_name'),
                 "Vendor": res['vendor_name'],
                 "Overall Score": res.get('overall_score', 0),
-                "Score Reasoning": res.get('scoring_reasoning', 'N/A'),
-                "Tech Score": res.get('technical_score', 0),
-                "Compliance Score": res.get('compliance_score', 0),
                 "Recommendation": res.get('recommendation', 'N/A'),
                 "Red Flags": str(res.get('flags', [])[:3])
             })
-        
         st.dataframe(pd.DataFrame(comparison_data), use_container_width=True)
 
-        #  STEP 4: ACTIONS 
+        
+        # NEW FEATURE: DETAILED VENDOR TABLES (Requested Update)
+        
+        st.markdown("---")
+        st.subheader(" Detailed Compliance Audit (Vendor vs RFP)")
+        st.info("Select a vendor below to see exactly which RFP parameters they matched or missed.")
+
+        # 1. Vendor Selector
+        vendor_names = [v['vendor_name'] for v in st.session_state['vendor_results']]
+        selected_vendor_name = st.selectbox("Select Vendor to Audit:", vendor_names)
+
+        # 2. Get Data for Selected Vendor
+        selected_data = next((item for item in st.session_state['vendor_results'] if item["vendor_name"] == selected_vendor_name), None)
+
+        # 3. Display Detailed Table
+        if selected_data and 'compliance_breakdown' in selected_data:
+            df_details = pd.DataFrame(selected_data['compliance_breakdown'])
+            
+            # Color Styling Function
+            def highlight_status(val):
+                color = 'white'
+                val_str = str(val).lower()
+                if 'match' in val_str:
+                    color = '#d4edda' # Light Green
+                elif 'miss' in val_str or 'not' in val_str:
+                    color = '#f8d7da' # Light Red
+                elif 'partial' in val_str:
+                    color = '#fff3cd' # Light Yellow
+                return f'background-color: {color}'
+
+            try:
+                st.write(f"###  {selected_vendor_name} - Parameter Compliance Table")
+                st.dataframe(
+                    df_details.style.map(highlight_status, subset=['Vendor_Status']),
+                    use_container_width=True,
+                    height=500
+                )
+            except Exception as e:
+                # Fallback if pandas styling fails
+                st.dataframe(df_details, use_container_width=True)
+        else:
+            st.warning("No detailed compliance data available for this vendor.")
+        
+        
+        # END NEW FEATURE
+        
+
+        # STEP 4: ACTIONS
         st.markdown("---")
         col_a, col_b = st.columns(2)
         
         with col_a:
             st.subheader(" Export Report")
             df = pd.DataFrame(st.session_state['vendor_results'])
+            # Convert list columns to strings for CSV export
+            df['flags'] = df['flags'].apply(lambda x: str(x))
+            df['compliance_breakdown'] = df.get('compliance_breakdown', []).apply(lambda x: "See App for Details")
+            
             csv = df.to_csv(index=False).encode('utf-8')
             st.download_button("Download CSV", csv, "final_report.csv", "text/csv")
             
         with col_b:
             st.subheader(" Smart Negotiation")
-            vendor_names = [v['vendor_name'] for v in st.session_state['vendor_results']]
-            selected_vendor = st.selectbox("Select Vendor:", vendor_names)
+            selected_vendor_email = st.selectbox("Select Vendor for Email:", vendor_names, key="email_sel")
             
             if st.button("Draft Email"):
-                v_data = next(v for v in st.session_state['vendor_results'] if v['vendor_name'] == selected_vendor)
+                v_data = next(v for v in st.session_state['vendor_results'] if v['vendor_name'] == selected_vendor_email)
                 with st.spinner("Drafting..."):
                     email_content = generate_negotiation_email(
                         v_data['vendor_name'], 
@@ -378,6 +418,6 @@ with tab1:
 
 with tab2:
     st.header(" Database History")
-    if st.button("Refresh"):
+    if st.button("Refresh History"):
         df_hist = fetch_history()
         st.dataframe(df_hist, use_container_width=True)
